@@ -1,28 +1,20 @@
 # Coolify 用 docker-compose.yml
 # hikabooru → X ランダムメディア投稿 bot
+#
+# デプロイ: Coolify Docker Compose Application
+# cookie.json は同一リポジトリの data/ から読み込み
 
 services:
   hikabooru-x-poster:
     build: .
     container_name: hikabooru-x-poster
     restart: unless-stopped
-    volumes:
-      - ./data:/data
     environment:
       - TZ=Asia/Tokyo
     command:
       - "python3"
       - "hikabooru_x_poster.py"
       - "--cookie"
-      - "/data/cookie.json"
+      - "/app/data/cookie.json"
       - "--interval"
       - "900"
-    
-    # テストモード:
-    # command:
-    #   - "python3"
-    #   - "hikabooru_x_poster.py"
-    #   - "--test"
-    #   - "--once"
-    #   - "--cookie"
-    #   - "/data/cookie.json"
