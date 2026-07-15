@@ -13,6 +13,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY hikabooru_x_poster.py .
-COPY data/cookie.json data/cookie.json
+
+# cookie.json は Coolify の環境変数 COOKIE_JSON から注入
+# 起動時に env var → /app/data/cookie.json に書き出す
 
 CMD ["python3", "hikabooru_x_poster.py", "--cookie", "/app/data/cookie.json", "--interval", "900"]
