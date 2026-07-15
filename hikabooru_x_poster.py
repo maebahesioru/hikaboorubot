@@ -240,12 +240,13 @@ class XPoster:
     async def post_media(self, media_path: str, is_video: bool = False) -> str:
         """
         メディアをアップロードしてツイート。
-        動画の場合は media_category と video_info を適切に設定。
+        動画の場合は upload_media で wait_for_completion + tweet_video カテゴリ指定。
+        create_tweet は video_info 不要（Xが自動でメタデータ取得）。
         """
         if self.client is None:
             raise RuntimeError("XPoster.setup() を先に呼んでください")
 
-        # アップロード（動画はカテゴリ指定＋処理完了待ち）
+        # アップロード（動画は処理完了待ち＋カテゴリ指定）
         if is_video:
             media_id = await self.client.upload_media(
                 media_path,
@@ -255,68 +256,9 @@ class XPoster:
         else:
             media_id = await self.client.upload_media(media_path)
 
-        # 動画なら media_entities に video_info が必要 → gql.create_tweet をパッチ
-        if is_video:
-            tweet = await self._create_tweet_with_video(media_id, media_path)
-        else:
-            tweet = await self.client.create_tweet(text="", media_ids=[media_id])
-
+        # create_tweet は画像も動画も同じ呼び出しでOK
+        tweet = await self.client.create_tweet(text="", media_ids=[media_id])
         return tweet.id if hasattr(tweet, 'id') else str(tweet)
-
-    async def _create_tweet_with_video(self, media_id: str, video_path: str):
-        """
-        動画用: media_entities に video_info を含めて CreateTweet。
-        twifork の create_tweet は video_info 未対応なので直接 GQL を呼ぶ。
-        """
-        from twikit.client.gql import Endpoint
-        from twikit.constants import FEATURES
-
-        # ffprobe で動画メタデータ取得
-        width, height, duration_ms = self._get_video_meta(video_path)
-
-        media_entities = [{
-            "media_id": media_id,
-            "tagged_users": [],
-            "video_info": {
-                "duration_ms": duration_ms,
-                "width": width,
-                "height": height,
-                "aspect_ratio": [width, height],
-            },
-        }]
-        variables = {
-            "tweet_text": "",
-            "dark_request": False,
-            "media": {
-                "media_entities": media_entities,
-                "possibly_sensitive": False,
-            },
-            "semantic_annotation_ids": [],
-        }
-        response, _ = await self.client.gql.gql_post(
-            Endpoint.CREATE_TWEET, variables, FEATURES
-        )
-        tweet_id = response["data"]["create_tweet"]["tweet_results"]["result"]["rest_id"]
-        from twikit.tweet import Tweet
-        return Tweet(self.client, {"rest_id": tweet_id, "legacy": {"full_text": ""}})
-
-    @staticmethod
-    def _get_video_meta(path: str) -> tuple[int, int, int]:
-        """ffprobeで動画の width, height, duration_ms を取得"""
-        import subprocess as sp
-        result = sp.run([
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            path,
-        ], capture_output=True, text=True, timeout=15)
-        data = orjson.loads(result.stdout)
-        duration = float(data["format"]["duration"])
-        for stream in data["streams"]:
-            if stream["codec_type"] == "video":
-                return stream["width"], stream["height"], int(duration * 1000)
-        # 動画ストリームが見つからない場合のフォールバック
-        return 640, 360, int(duration * 1000)
 
     async def close(self):
         pass
