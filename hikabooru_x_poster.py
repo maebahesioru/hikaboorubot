@@ -3,10 +3,10 @@
 hikabooru_x_poster.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 hikabooru（Oxibooru）から完全ランダムに画像/動画/GIFを選び、
-15分毎に X (Twitter) にメディアのみ投稿する bot。
+30分毎に X (Twitter) にメディアのみ投稿する bot。
 
 使い方:
-  # 本番（15分間隔で永続実行）
+  # 本番（30分間隔で永続実行）
   python hikabooru_x_poster.py
 
   # テスト（投稿せずランダム選出のみ表示）
@@ -56,7 +56,7 @@ _txn.ClientTransaction.__init__ = _patched_init
 
 HIKABOORU_BASE = "https://hikabooru.hikamer.f5.si"
 MAX_VIDEO_DURATION = 140  # 秒（Xの制限）
-DEFAULT_INTERVAL = 900  # 15分（秒）
+DEFAULT_INTERVAL = 1800  # 30分（秒）
 
 # 環境に応じたデフォルトCookieパス
 #   Docker/Coolify → /data/cookie.json （docker-composeで明示的に渡すので実質使われない）
@@ -237,15 +237,88 @@ class XPoster:
             log.warning("X認証確認中の警告（投稿は試行されます）: %s", e)
         return self
 
-    async def post_media(self, media_path: str) -> str:
+    async def post_media(self, media_path: str, is_video: bool = False) -> str:
+        """
+        メディアをアップロードしてツイート。
+        動画の場合は media_category と video_info を適切に設定。
+        """
         if self.client is None:
             raise RuntimeError("XPoster.setup() を先に呼んでください")
-        media_id = await self.client.upload_media(media_path)
-        tweet = await self.client.create_tweet(text="", media_ids=[media_id])
+
+        # アップロード（動画はカテゴリ指定＋処理完了待ち）
+        if is_video:
+            media_id = await self.client.upload_media(
+                media_path,
+                wait_for_completion=True,
+                media_category="tweet_video",
+            )
+        else:
+            media_id = await self.client.upload_media(media_path)
+
+        # 動画なら media_entities に video_info が必要 → gql.create_tweet をパッチ
+        if is_video:
+            tweet = await self._create_tweet_with_video(media_id, media_path)
+        else:
+            tweet = await self.client.create_tweet(text="", media_ids=[media_id])
+
         return tweet.id if hasattr(tweet, 'id') else str(tweet)
 
+    async def _create_tweet_with_video(self, media_id: str, video_path: str):
+        """
+        動画用: media_entities に video_info を含めて CreateTweet。
+        twifork の create_tweet は video_info 未対応なので直接 GQL を呼ぶ。
+        """
+        from twikit.client.gql import Endpoint
+        from twikit.constants import FEATURES
+
+        # ffprobe で動画メタデータ取得
+        width, height, duration_ms = self._get_video_meta(video_path)
+
+        media_entities = [{
+            "media_id": media_id,
+            "tagged_users": [],
+            "video_info": {
+                "duration_ms": duration_ms,
+                "width": width,
+                "height": height,
+                "aspect_ratio": [width, height],
+            },
+        }]
+        variables = {
+            "tweet_text": "",
+            "dark_request": False,
+            "media": {
+                "media_entities": media_entities,
+                "possibly_sensitive": False,
+            },
+            "semantic_annotation_ids": [],
+        }
+        response, _ = await self.client.gql.gql_post(
+            Endpoint.CREATE_TWEET, variables, FEATURES
+        )
+        tweet_id = response["data"]["create_tweet"]["tweet_results"]["result"]["rest_id"]
+        from twikit.tweet import Tweet
+        return Tweet(self.client, {"rest_id": tweet_id, "legacy": {"full_text": ""}})
+
+    @staticmethod
+    def _get_video_meta(path: str) -> tuple[int, int, int]:
+        """ffprobeで動画の width, height, duration_ms を取得"""
+        import subprocess as sp
+        result = sp.run([
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-show_format", "-show_streams",
+            path,
+        ], capture_output=True, text=True, timeout=15)
+        data = orjson.loads(result.stdout)
+        duration = float(data["format"]["duration"])
+        for stream in data["streams"]:
+            if stream["codec_type"] == "video":
+                return stream["width"], stream["height"], int(duration * 1000)
+        # 動画ストリームが見つからない場合のフォールバック
+        return 640, 360, int(duration * 1000)
+
     async def close(self):
-        # logout() は呼ばない（Cookieが無効化されるため）
         pass
 
 
@@ -331,9 +404,15 @@ async def pick_random_media(hikabooru: HikabooruClient) -> dict:
             continue
 
         if ptype == "video":
-            # TODO: 動画は metadata (videoInfo) が必要でtwifork未対応のため一旦スキップ
-            log.debug("#%d は動画（twifork未対応のためスキップ）", pid)
-            continue
+            url = hikabooru.content_url(post)
+            duration = get_video_duration(url)
+            if duration < 0:
+                log.debug("#%d 動画時間取得失敗、スキップ", pid)
+                continue
+            if duration > MAX_VIDEO_DURATION:
+                log.info("#%d 動画が%.0f秒（>%d秒）、再抽選", pid, duration, MAX_VIDEO_DURATION)
+                continue
+            log.info("#%d 動画%.0f秒 OK", pid, duration)
 
         log.info("✅ %s", hikabooru.post_summary(post))
         return post
@@ -387,8 +466,10 @@ async def run_once(hikabooru: HikabooruClient,
     http = await hikabooru._client()
     tmp_path = await download_media(http, content_url)
 
+    is_video = hikabooru.post_type(post) == "video"
+
     try:
-        tweet_id = await xposter.post_media(tmp_path)
+        tweet_id = await xposter.post_media(tmp_path, is_video=is_video)
         log.info("🎉 投稿成功! tweet_id=%s | post_id=%d", tweet_id, post["id"])
         print(f"   ✅ 投稿成功! tweet_id={tweet_id}\n")
     except Exception as e:
@@ -451,7 +532,7 @@ def main():
     parser.add_argument("--once", action="store_true",
                         help="1回だけ実行して終了")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
-                        help=f"実行間隔（秒）（デフォルト: {DEFAULT_INTERVAL}秒=15分）")
+                        help=f"実行間隔（秒）（デフォルト: {DEFAULT_INTERVAL}秒=30分）")
     parser.add_argument("--cookie", type=str, default=_default_cookie_path(),
                         help="ブラウザエクスポートCookieのJSONファイルパス")
     args = parser.parse_args()
