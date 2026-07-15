@@ -331,15 +331,9 @@ async def pick_random_media(hikabooru: HikabooruClient) -> dict:
             continue
 
         if ptype == "video":
-            url = hikabooru.content_url(post)
-            duration = get_video_duration(url)
-            if duration < 0:
-                log.debug("#%d 動画時間取得失敗、スキップ", pid)
-                continue
-            if duration > MAX_VIDEO_DURATION:
-                log.info("#%d 動画が%.0f秒（>%d秒）、再抽選", pid, duration, MAX_VIDEO_DURATION)
-                continue
-            log.info("#%d 動画%.0f秒 OK", pid, duration)
+            # TODO: 動画は metadata (videoInfo) が必要でtwifork未対応のため一旦スキップ
+            log.debug("#%d は動画（twifork未対応のためスキップ）", pid)
+            continue
 
         log.info("✅ %s", hikabooru.post_summary(post))
         return post
