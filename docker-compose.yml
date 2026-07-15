@@ -1,0 +1,28 @@
+# Coolify 用 docker-compose.yml
+# hikabooru → X ランダムメディア投稿 bot
+
+services:
+  hikabooru-x-poster:
+    build: .
+    container_name: hikabooru-x-poster
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      - TZ=Asia/Tokyo
+    command:
+      - "python3"
+      - "hikabooru_x_poster.py"
+      - "--cookie"
+      - "/data/cookie.json"
+      - "--interval"
+      - "900"
+    
+    # テストモード:
+    # command:
+    #   - "python3"
+    #   - "hikabooru_x_poster.py"
+    #   - "--test"
+    #   - "--once"
+    #   - "--cookie"
+    #   - "/data/cookie.json"

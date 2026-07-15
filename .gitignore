@@ -1,0 +1,4 @@
+﻿# hikaboorubot
+__pycache__/
+*.pyc
+data/cookie.json
