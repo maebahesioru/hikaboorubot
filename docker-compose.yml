@@ -1,11 +1,6 @@
 # Coolify 用 docker-compose.yml
 # hikabooru → X + Misskey マルチ投稿 bot
-#
-# 環境変数:
-#   COOKIE_JSON   - X Cookie（ブラウザエクスポートJSON）
-#   MISSKEY_TOKEN - Misskey APIトークン（必須）
-#
-# X: 30分間隔 / Misskey: 5分間隔（レート制限なし）
+# X: 30分間隔 / Misskey: 5分間隔
 
 services:
   hikabooru-x-poster:
