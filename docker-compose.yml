@@ -1,8 +1,11 @@
 # Coolify 用 docker-compose.yml
-# hikabooru → X ランダムメディア投稿 bot
+# hikabooru → X + Misskey マルチ投稿 bot
 #
-# COOKIE_JSON 環境変数にブラウザエクスポートCookieのJSON内容を設定
-# 本番モード: 30分毎にX投稿
+# 環境変数:
+#   COOKIE_JSON   - X Cookie（ブラウザエクスポートJSON）
+#   MISSKEY_TOKEN - Misskey APIトークン（必須）
+#
+# X: 30分間隔 / Misskey: 5分間隔（レート制限なし）
 
 services:
   hikabooru-x-poster:
@@ -12,10 +15,15 @@ services:
     environment:
       - TZ=Asia/Tokyo
       - COOKIE_JSON=${COOKIE_JSON:-}
+      - MISSKEY_TOKEN=${MISSKEY_TOKEN}
     command:
       - "/bin/sh"
       - "-c"
       - |
         mkdir -p /app/data
         echo "$${COOKIE_JSON}" > /app/data/cookie.json
-        exec python3 hikabooru_x_poster.py --cookie /app/data/cookie.json --interval 1800
+        exec python3 hikabooru_x_poster.py \
+          --cookie /app/data/cookie.json \
+          --x-interval 1800 \
+          --misskey-interval 300 \
+          --misskey-token "$${MISSKEY_TOKEN}"
