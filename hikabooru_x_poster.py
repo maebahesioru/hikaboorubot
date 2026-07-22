@@ -62,7 +62,7 @@ _txn.ClientTransaction.__init__ = _patched_init
 HIKABOORU_BASE = "https://hikabooru.hikamer.f5.si"
 MAX_VIDEO_DURATION = 140  # 秒（Xの制限）
 X_DEFAULT_INTERVAL = 1800  # 30分
-MISSKEY_DEFAULT_INTERVAL = 300  # 5分（レート制限なし）
+MISSKEY_DEFAULT_INTERVAL = 1800  # 30分
 
 MISSKEY_BASE = "https://sikotter.hikamer.f5.si"
 # MISSKEY_TOKEN は環境変数または --misskey-token で指定
@@ -654,7 +654,7 @@ def main():
                         help="Xを無効にする")
     # Misskey 用
     parser.add_argument("--misskey-interval", type=int, default=MISSKEY_DEFAULT_INTERVAL,
-                        help=f"Misskey投稿間隔（秒）（デフォルト: {MISSKEY_DEFAULT_INTERVAL}秒=5分）")
+                        help=f"Misskey投稿間隔（秒）（デフォルト: {MISSKEY_DEFAULT_INTERVAL}秒=30分）")
     parser.add_argument("--misskey-token", type=str, required=False, default="",
                         help="Misskey APIトークン")
     parser.add_argument("--misskey-max-duration", type=int, default=600,
