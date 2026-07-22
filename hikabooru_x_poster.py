@@ -33,6 +33,7 @@ import asyncio
 import orjson
 import logging
 import os
+import pickle
 import random
 import subprocess
 import sys
@@ -66,6 +67,11 @@ MISSKEY_DEFAULT_INTERVAL = 300  # 5分（レート制限なし）
 MISSKEY_BASE = "https://sikotter.hikamer.f5.si"
 # MISSKEY_TOKEN は環境変数または --misskey-token で指定
 
+def _default_markov_path() -> str:
+    if os.path.isdir("/data"):
+        return "/data/markov_model.pkl"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "markov_model.pkl")
+
 def _default_cookie_path() -> str:
     if os.path.isdir("/data"):
         return "/data/cookie.json"
@@ -83,6 +89,57 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("hikabooru_x")
+
+
+# ═══════════════════════════════════════════════════════════════
+# マルコフ連鎖テキスト生成器
+# ═══════════════════════════════════════════════════════════════
+
+BOS, EOS = "__BOS__", "__EOS__"
+
+
+class MarkovGenerator:
+    """マルコフ連鎖でランダムな日本語テキストを生成"""
+
+    def __init__(self, model_path: str):
+        with open(model_path, "rb") as f:
+            model = pickle.load(f)
+        self.n = model["n_gram"]
+        self.transitions = model["transitions"]
+        log.info("Markov model loaded: n_gram=%d, contexts=%d, sentences=%d",
+                 self.n, model.get("contexts", 0), model.get("total_sentences", 0))
+
+    def generate(self, min_len: int = 1, max_tokens: int = 200) -> str:
+        """テキストを1つ生成。@やURLを含むトークンは除外"""
+        for _ in range(100):
+            ctx = tuple([BOS] * (self.n - 1))
+            tokens = []
+            for _ in range(max_tokens):
+                if ctx not in self.transitions:
+                    break
+                candidates = self.transitions[ctx]
+                token_names = [t for t, _ in candidates]
+                weights = [c for _, c in candidates]
+
+                # @とURLを含むトークンはスキップ
+                for _ in range(50):
+                    t = random.choices(token_names, weights=weights, k=1)[0]
+                    if not t.startswith("@") and not t.startswith("http"):
+                        break
+                else:
+                    break
+
+                if t == EOS:
+                    if len(tokens) < min_len:
+                        continue
+                    break
+                tokens.append(t)
+                ctx = ctx[1:] + (t,)
+
+            if len(tokens) >= min_len:
+                return "".join(tokens).replace("\\n", "\n")
+
+        return ""  # 生成失敗
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -215,7 +272,7 @@ class XPoster:
             log.warning("X認証確認中の警告: %s", e)
         return self
 
-    async def post_media(self, media_path: str, is_video: bool = False) -> str:
+    async def post_media(self, media_path: str, is_video: bool = False, text: str = "") -> str:
         if self.client is None:
             raise RuntimeError("XPoster.setup() を先に呼んでください")
         if is_video:
@@ -224,7 +281,7 @@ class XPoster:
             )
         else:
             media_id = await self.client.upload_media(media_path)
-        tweet = await self.client.create_tweet(text="", media_ids=[media_id])
+        tweet = await self.client.create_tweet(text=text, media_ids=[media_id])
         return tweet.id if hasattr(tweet, 'id') else str(tweet)
 
     async def close(self):
@@ -256,7 +313,7 @@ class MisskeyPoster:
             await self._http.aclose()
             self._http = None
 
-    async def post_media(self, media_path: str, is_video: bool = False) -> str:
+    async def post_media(self, media_path: str, is_video: bool = False, text: str = "") -> str:
         """メディアをアップロードしてノート作成。戻り値は note_id。
         is_video は Misskey では未使用（XPosterとのインターフェース統一のため）"""
         http = await self._client()
@@ -275,12 +332,12 @@ class MisskeyPoster:
         log.info("Misskey drive upload: %s (id=%s)", file_name, file_id)
 
         # 2. ノート作成（text は1文字以上必須）
-        text = " "  # 最小1文字
+        note_text = text if text else " "
         resp = await http.post(
             f"{self.base}/api/notes/create",
             json={
                 "i": self.token,
-                "text": text,
+                "text": note_text,
                 "fileIds": [file_id],
                 "visibility": "public",
             },
@@ -372,6 +429,7 @@ async def platform_loop(
     max_video_duration: int,
     ok_exts: set[str],
     test_mode: bool,
+    markov: Optional[MarkovGenerator] = None,
 ):
     """1プラットフォーム分の投稿ループ"""
     log.info("[%s] 開始 (間隔=%d秒, 動画制限=%d秒)", name, interval, max_video_duration)
@@ -417,7 +475,10 @@ async def platform_loop(
                         pass
 
                 try:
-                    post_id = await poster.post_media(converted, is_video=is_video)
+                    markov_text = markov.generate(max_tokens=50) if markov else ""
+                    post_id = await poster.post_media(converted, is_video=is_video, text=markov_text)
+                    if markov_text:
+                        log.info("[%s] マルコフ文: %s", name, markov_text[:80])
                     log.info("[%s] 🎉 投稿成功! post_id=%s | hikabooru_id=%d", name, post_id, pid)
                     print(f"   ✅ [{name}] 投稿成功! id={post_id}\n")
                 except Exception as e:
@@ -447,6 +508,15 @@ async def main_loop(args):
 
     hikabooru = HikabooruClient()
 
+    # マルコフ連鎖モデル読み込み
+    markov = None
+    if not args.no_markov and not args.test:
+        try:
+            markov = MarkovGenerator(args.markov_model)
+            log.info("マルコフ連鎖: 有効")
+        except Exception as e:
+            log.warning("マルコフモデル読み込み失敗（無効で続行）: %s", e)
+
     tasks = []
 
     if not args.once:
@@ -458,7 +528,7 @@ async def main_loop(args):
             tasks.append(platform_loop(
                 "X", hikabooru, xposter,
                 args.x_interval, MAX_VIDEO_DURATION, X_OK_EXTS,
-                args.test,
+                args.test, markov=markov,
             ))
 
         if not args.no_misskey:
@@ -466,7 +536,7 @@ async def main_loop(args):
             tasks.append(platform_loop(
                 "Misskey", hikabooru, misskey_poster,
                 args.misskey_interval, args.misskey_max_duration, MISSKEY_OK_EXTS,
-                args.test,
+                args.test, markov=markov,
             ))
 
     if args.once:
@@ -517,11 +587,21 @@ async def run_once_all(hikabooru: HikabooruClient, args):
     ptype = HikabooruClient.post_type(post)
     is_video = (ptype == "video")
 
+    # マルコフ文
+    markov_text = ""
+    if not args.no_markov and not args.test:
+        try:
+            m = MarkovGenerator(args.markov_model)
+            markov_text = m.generate(max_tokens=50)
+            print(f"   💬 マルコフ: {markov_text[:100]}")
+        except Exception as e:
+            log.warning("マルコフ生成失敗: %s", e)
+
     if not args.no_x:
         x_conv = convert_for_platform(tmp_path, X_OK_EXTS)
         xposter = await XPoster(args.cookie).setup()
         try:
-            tid = await xposter.post_media(x_conv, is_video=is_video)
+            tid = await xposter.post_media(x_conv, is_video=is_video, text=markov_text)
             log.info("🎉 X投稿成功! tweet_id=%s | post_id=%d", tid, post["id"])
             print(f"   ✅ X: tweet_id={tid}")
             results["X"] = tid
@@ -536,7 +616,7 @@ async def run_once_all(hikabooru: HikabooruClient, args):
         mk_conv = convert_for_platform(tmp_path, MISSKEY_OK_EXTS)
         misskey = MisskeyPoster(token=args.misskey_token)
         try:
-            nid = await misskey.post_media(mk_conv)
+            nid = await misskey.post_media(mk_conv, text=markov_text)
             log.info("🎉 Misskey投稿成功! note_id=%s | post_id=%d", nid, post["id"])
             print(f"   ✅ Misskey: note_id={nid}")
             results["Misskey"] = nid
@@ -581,6 +661,11 @@ def main():
                         help="Misskeyの動画最大秒数（デフォルト: 600秒=10分）")
     parser.add_argument("--no-misskey", action="store_true",
                         help="Misskeyを無効にする")
+    # マルコフ連鎖
+    parser.add_argument("--markov-model", type=str, default=_default_markov_path(),
+                        help="マルコフ連鎖モデルの.pklファイルパス")
+    parser.add_argument("--no-markov", action="store_true",
+                        help="マルコフ連鎖テキスト生成を無効にする")
     args = parser.parse_args()
 
     if args.no_x and args.no_misskey:
