@@ -231,6 +231,7 @@ class XPoster:
         self.cookie_path = cookie_path
         self.client: Optional[Client] = None
         self._my_user_id: Optional[str] = None
+        self.my_tweet_ids: Set[str] = set()  # 自分が投稿したオリジナルツイートID
 
     async def setup(self):
         cookies = convert_cookies(self.cookie_path)
@@ -246,6 +247,10 @@ class XPoster:
     @property
     def user_id(self) -> str:
         return self._my_user_id or ""
+
+    def is_my_original(self, tweet_id: str) -> bool:
+        """そのIDが自分のオリジナル投稿か（リプライではない）"""
+        return tweet_id in self.my_tweet_ids
 
     async def upload_and_tweet(self, media_path: str, is_video: bool = False, text: str = "",
                                 reply_to: str = "") -> str:
@@ -343,6 +348,12 @@ class ReplyHandler:
             if not tid or tid in self.processed:
                 continue
 
+            # 自分のツイート（ソースリプライ等）→ 絶対スキップ
+            tweet_uid = str(getattr(tweet, 'user', None) and getattr(tweet.user, 'id', ''))
+            if tweet_uid == bot_uid:
+                self._mark_processed(tid)
+                continue
+
             # 自分のツイートへの直接リプライのみ対象
             reply_to_uid = str(getattr(tweet, 'in_reply_to_user_id', ''))
             reply_to_tid = str(getattr(tweet, 'in_reply_to_status_id', ''))
@@ -353,6 +364,12 @@ class ReplyHandler:
                 continue
 
             if not reply_to_tid:
+                self._mark_processed(tid)
+                continue
+
+            # 自分の「オリジナル投稿」へのリプライのみ（リプライのリプライは除外）
+            if not self.xposter.is_my_original(reply_to_tid):
+                log.debug("🔕 リプライのリプライをスキップ: %s → %s", tid, reply_to_tid)
                 self._mark_processed(tid)
                 continue
 
@@ -521,6 +538,9 @@ async def x_post_loop(
                     if markov_text:
                         log.info("[X] マルコフ文: %s", markov_text[:80])
                     log.info("[X] 🎉 投稿成功! tweet_id=%s | hikabooru_id=%d", tweet_id, pid)
+
+                    # オリジナル投稿として登録（自動返信の対象判定に使う）
+                    xposter.my_tweet_ids.add(tweet_id)
 
                     # ソースリンクをリプライで貼る
                     try:
