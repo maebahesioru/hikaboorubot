@@ -336,21 +336,28 @@ class ReplyHandler:
             return
 
         try:
-            tweets = await self.xposter.search_mentions("to:hikabooru", count=30)
+            tweets = await self.xposter.search_mentions("@hikabooru", count=30)
         except Exception:
             return
 
         if not tweets:
             return
 
+        found_count = 0
         for tweet in tweets:
             tid = str(tweet.id) if hasattr(tweet, 'id') else ""
             if not tid or tid in self.processed:
                 continue
+            found_count += 1
 
             # 自分のツイート（ソースリプライ等）→ 絶対スキップ
-            tweet_uid = str(getattr(tweet, 'user', None) and getattr(tweet.user, 'id', ''))
+            tweet_uid = ""
+            try:
+                tweet_uid = str(tweet.user.id)
+            except Exception:
+                pass
             if tweet_uid == bot_uid:
+                log.info("🔕 自己ツイートをスキップ: %s", tid)
                 self._mark_processed(tid)
                 continue
 
@@ -360,16 +367,18 @@ class ReplyHandler:
 
             if reply_to_uid != bot_uid:
                 # 他人のツイート宛またはメンション → スキップ
+                log.info("🔕 reply_to_uid不一致: %s (期待=%s, 実際=%s)", tid, bot_uid, reply_to_uid)
                 self._mark_processed(tid)
                 continue
 
             if not reply_to_tid:
+                log.info("🔕 reply先なし (直接メンション): %s", tid)
                 self._mark_processed(tid)
                 continue
 
             # 自分の「オリジナル投稿」へのリプライのみ（リプライのリプライは除外）
             if not self.xposter.is_my_original(reply_to_tid):
-                log.debug("🔕 リプライのリプライをスキップ: %s → %s", tid, reply_to_tid)
+                log.info("🔕 リプライのリプライをスキップ: %s → %s", tid, reply_to_tid)
                 self._mark_processed(tid)
                 continue
 
@@ -384,6 +393,9 @@ class ReplyHandler:
             finally:
                 self._mark_processed(tid)
             return  # 1件処理したら終了（連投防止）
+
+        if found_count > 0:
+            log.info("[返信] チェック: 新規%d件 → 対象なし", found_count)
 
     async def _do_reply(self, reply_to_tweet_id: str):
         """ランダム画像 + マルコフ文 でリプライ"""
