@@ -1,6 +1,5 @@
 # Coolify 用 docker-compose.yml
-# hikabooru → X + Misskey マルチ投稿 bot
-# X: 30分間隔 / Misskey: 30分間隔
+# hikabooru → X 投稿 bot（30分間隔 + マルコフ連鎖テキスト）
 
 services:
   hikabooru-x-poster:
@@ -10,7 +9,6 @@ services:
     environment:
       - TZ=Asia/Tokyo
       - COOKIE_JSON=${COOKIE_JSON:-}
-      - MISSKEY_TOKEN=${MISSKEY_TOKEN}
     command:
       - "/bin/sh"
       - "-c"
@@ -20,5 +18,4 @@ services:
         exec python3 hikabooru_x_poster.py \
           --cookie /app/data/cookie.json \
           --x-interval 1800 \
-          --misskey-interval 1800 \
-          --misskey-token "$${MISSKEY_TOKEN}"
+          --no-misskey
