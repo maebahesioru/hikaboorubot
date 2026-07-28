@@ -70,6 +70,11 @@ def _default_reply_db_path() -> str:
         return "/data/replied_ids.json"
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "replied_ids.json")
 
+def _default_tweet_db_path() -> str:
+    if os.path.isdir("/data"):
+        return "/data/tweet_ids.json"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "tweet_ids.json")
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -227,11 +232,31 @@ def get_video_duration(url: str) -> float:
 # ═══════════════════════════════════════════════════════════════
 
 class XPoster:
-    def __init__(self, cookie_path: str):
+    def __init__(self, cookie_path: str, tweet_db_path: str = ""):
         self.cookie_path = cookie_path
+        self.tweet_db_path = tweet_db_path
         self.client: Optional[Client] = None
         self._my_user_id: Optional[str] = None
-        self.my_tweet_ids: Set[str] = set()  # 自分が投稿したオリジナルツイートID
+        self.my_tweet_ids: Set[str] = self._load_tweet_ids()
+
+    def _load_tweet_ids(self) -> Set[str]:
+        if not self.tweet_db_path:
+            return set()
+        try:
+            with open(self.tweet_db_path) as f:
+                return set(orjson.loads(f.read()))
+        except Exception:
+            return set()
+
+    def _save_tweet_ids(self):
+        if not self.tweet_db_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.tweet_db_path), exist_ok=True)
+            with open(self.tweet_db_path, "wb") as f:
+                f.write(orjson.dumps(list(self.my_tweet_ids)[-5000:]))
+        except Exception:
+            pass
 
     async def setup(self):
         cookies = convert_cookies(self.cookie_path)
@@ -546,6 +571,7 @@ async def x_post_loop(
 
                     # オリジナル投稿として登録（自動返信の対象判定に使う）
                     xposter.my_tweet_ids.add(tweet_id)
+                    xposter._save_tweet_ids()
 
                     # ソースリンクをリプライで貼る
                     try:
@@ -614,7 +640,7 @@ async def main_loop(args):
     # X投稿ループ
     if not args.no_x:
         if not args.test:
-            xposter = await XPoster(args.cookie).setup()
+            xposter = await XPoster(args.cookie, args.tweet_db).setup()
         else:
             xposter = None
         tasks.append(x_post_loop(xposter, hikabooru, args.interval, args.test, markov))
@@ -722,6 +748,8 @@ def main():
     parser.add_argument("--no-reply", action="store_true", help="自動返信無効")
     parser.add_argument("--reply-db", type=str, default=_default_reply_db_path(),
                         help="返信済みIDの保存先")
+    parser.add_argument("--tweet-db", type=str, default=_default_tweet_db_path(),
+                        help="自分のツイートIDの保存先")
     args = parser.parse_args()
 
     if not args.no_x and not os.path.exists(args.cookie):
