@@ -2,28 +2,19 @@
 """
 hikabooru_x_poster.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-hikabooru（Oxibooru）から完全ランダムに画像/動画/GIFを選び、
-X (Twitter) と Misskey にマルチ投稿する bot。
+hikabooru から完全ランダムに画像/動画を選び X に投稿する bot。
+- マルコフ連鎖テキスト付き投稿
+- 投稿後に hikabooru ソースリンクをリプライ
+- 自分のツイートへのリプライに自動返信
 
 使い方:
-  # 本番（X=30分、Misskey=5分で永続実行）
-  python hikabooru_x_poster.py
+  python hikabooru_x_poster.py                     # 本番
+  python hikabooru_x_poster.py --once              # 1回だけ
+  python hikabooru_x_poster.py --test              # テスト
+  python hikabooru_x_poster.py --no-reply          # 自動返信なし
+  python hikabooru_x_poster.py --no-markov         # マルコフなし
 
-  # Misskeyのみ
-  python hikabooru_x_poster.py --no-x
-
-  # Xのみ（30分間隔）
-  python hikabooru_x_poster.py --no-misskey
-
-  # テスト（投稿せずランダム選出のみ表示）
-  python hikabooru_x_poster.py --test
-
-  # 1回だけ投稿して終了
-  python hikabooru_x_poster.py --once
-
-依存:
-  pip install twifork httpx
-  ffprobe (ffmpeg)
+依存: pip install twifork httpx, ffmpeg/ffprobe
 """
 
 from __future__ import annotations
@@ -38,15 +29,14 @@ import random
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 import httpx
 from twikit import Client
 
-# twifork 2.3.5 のバグ修正: ClientTransaction.__init__ が
-# self.key / self.animation_key を初期化していない
+# twifork 2.3.5 バグ修正
 from twikit.x_client_transaction import transaction as _txn
 _orig_init = _txn.ClientTransaction.__init__
 def _patched_init(self):
@@ -60,12 +50,10 @@ _txn.ClientTransaction.__init__ = _patched_init
 # ═══════════════════════════════════════════════════════════════
 
 HIKABOORU_BASE = "https://hikabooru.hikamer.f5.si"
-MAX_VIDEO_DURATION = 140  # 秒（Xの制限）
-X_DEFAULT_INTERVAL = 1800  # 30分
-MISSKEY_DEFAULT_INTERVAL = 1800  # 30分
-
-MISSKEY_BASE = "https://sikotter.hikamer.f5.si"
-# MISSKEY_TOKEN は環境変数または --misskey-token で指定
+MAX_VIDEO_DURATION = 140
+DEFAULT_INTERVAL = 1800  # 30分
+REPLY_CHECK_INTERVAL = 90  # リプライチェック間隔（秒）
+REPLY_BACKOFF = 300  # 最後の返信から最低この秒数は次の返信を打たない
 
 def _default_markov_path() -> str:
     if os.path.isdir("/data"):
@@ -76,6 +64,11 @@ def _default_cookie_path() -> str:
     if os.path.isdir("/data"):
         return "/data/cookie.json"
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cookie.json")
+
+def _default_reply_db_path() -> str:
+    if os.path.isdir("/data"):
+        return "/data/replied_ids.json"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "replied_ids.json")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -99,18 +92,15 @@ BOS, EOS = "__BOS__", "__EOS__"
 
 
 class MarkovGenerator:
-    """マルコフ連鎖でランダムな日本語テキストを生成"""
-
     def __init__(self, model_path: str):
         with open(model_path, "rb") as f:
             model = pickle.load(f)
         self.n = model["n_gram"]
         self.transitions = model["transitions"]
-        log.info("Markov model loaded: n_gram=%d, contexts=%d, sentences=%d",
+        log.info("Markov: n_gram=%d, contexts=%d, sentences=%d",
                  self.n, model.get("contexts", 0), model.get("total_sentences", 0))
 
     def generate(self, min_len: int = 1, max_tokens: int = 200) -> str:
-        """テキストを1つ生成。@やURLを含むトークンは除外"""
         for _ in range(100):
             ctx = tuple([BOS] * (self.n - 1))
             tokens = []
@@ -120,26 +110,21 @@ class MarkovGenerator:
                 candidates = self.transitions[ctx]
                 token_names = [t for t, _ in candidates]
                 weights = [c for _, c in candidates]
-
-                # @とURLを含むトークンはスキップ
                 for _ in range(50):
                     t = random.choices(token_names, weights=weights, k=1)[0]
                     if not t.startswith("@") and not t.startswith("http"):
                         break
                 else:
                     break
-
                 if t == EOS:
                     if len(tokens) < min_len:
                         continue
                     break
                 tokens.append(t)
                 ctx = ctx[1:] + (t,)
-
             if len(tokens) >= min_len:
                 return "".join(tokens).replace("\\n", "\n")
-
-        return ""  # 生成失敗
+        return ""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -154,11 +139,10 @@ def convert_cookies(browser_cookie_path: str) -> dict[str, str]:
     if isinstance(data, list):
         cookies = {}
         for c in data:
-            name = c.get("name", "")
-            if name in ("auth_token", "ct0"):
-                cookies[name] = c["value"]
+            if c.get("name") in ("auth_token", "ct0"):
+                cookies[c["name"]] = c["value"]
         if "auth_token" not in cookies:
-            raise ValueError("auth_token がCookieファイルに見つかりません。")
+            raise ValueError("auth_token 不在")
         return cookies
     raise ValueError(f"不明なCookie形式: {type(data)}")
 
@@ -168,8 +152,6 @@ def convert_cookies(browser_cookie_path: str) -> dict[str, str]:
 # ═══════════════════════════════════════════════════════════════
 
 class HikabooruClient:
-    """Oxibooru (hikabooru) API からランダム投稿を取得"""
-
     def __init__(self, base_url: str = HIKABOORU_BASE):
         self.base = base_url
         self.api = f"{base_url}/api"
@@ -177,10 +159,7 @@ class HikabooruClient:
 
     async def _client(self) -> httpx.AsyncClient:
         if self._http is None:
-            self._http = httpx.AsyncClient(
-                headers={"User-Agent": USER_AGENT},
-                timeout=30.0,
-            )
+            self._http = httpx.AsyncClient(headers={"User-Agent": USER_AGENT}, timeout=30.0)
         return self._http
 
     async def close(self):
@@ -190,31 +169,25 @@ class HikabooruClient:
 
     async def random_post(self) -> dict:
         http = await self._client()
-        resp = await http.get(
-            f"{self.api}/posts",
-            params={"query": "sort:random", "limit": 1},
-        )
+        resp = await http.get(f"{self.api}/posts", params={"query": "sort:random", "limit": 1})
         resp.raise_for_status()
         total = resp.json().get("total")
         if not total:
-            raise RuntimeError("総投稿数を取得できませんでした")
+            raise RuntimeError("総投稿数取得失敗")
         offset = random.randint(0, total - 1)
-        resp = await http.get(
-            f"{self.api}/posts",
-            params={"query": "sort:random", "limit": 1, "offset": offset},
-        )
+        resp = await http.get(f"{self.api}/posts", params={"query": "sort:random", "limit": 1, "offset": offset})
         resp.raise_for_status()
         data = resp.json()
         results = data.get("results", [])
         if not results:
-            raise RuntimeError("hikabooruから投稿が取得できませんでした")
+            raise RuntimeError("投稿取得失敗")
         return results[0]
 
     def content_url(self, post: dict) -> str:
         return f"{self.base}/{post['contentUrl']}"
 
-    def thumbnail_url(self, post: dict) -> str:
-        return f"{self.base}/{post['thumbnailUrl']}"
+    def view_url(self, post: dict) -> str:
+        return f"{self.base}/post/view/{post['id']}"
 
     @staticmethod
     def post_type(post: dict) -> str:
@@ -233,14 +206,13 @@ class HikabooruClient:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 動画時間チェック
+# 動画時間
 # ═══════════════════════════════════════════════════════════════
 
 def get_video_duration(url: str) -> float:
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "csv=p=0", url],
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", url],
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -255,103 +227,191 @@ def get_video_duration(url: str) -> float:
 # ═══════════════════════════════════════════════════════════════
 
 class XPoster:
-    """twiforkを使ってXにメディア投稿。Cookie認証のみ"""
-
     def __init__(self, cookie_path: str):
         self.cookie_path = cookie_path
         self.client: Optional[Client] = None
+        self._my_user_id: Optional[str] = None
 
     async def setup(self):
         cookies = convert_cookies(self.cookie_path)
         self.client = Client(language="ja")
         self.client.set_cookies(cookies)
         try:
-            uid = await self.client.user_id()
-            log.info("X認証OK (user_id=%s)", uid)
+            self._my_user_id = str(await self.client.user_id())
+            log.info("X認証OK (user_id=%s)", self._my_user_id)
         except Exception as e:
-            log.warning("X認証確認中の警告: %s", e)
+            log.warning("X認証警告: %s", e)
         return self
 
-    async def post_media(self, media_path: str, is_video: bool = False, text: str = "") -> str:
+    @property
+    def user_id(self) -> str:
+        return self._my_user_id or ""
+
+    async def upload_and_tweet(self, media_path: str, is_video: bool = False, text: str = "",
+                                reply_to: str = "") -> str:
+        """メディアをアップロードしてツイート。reply_to 指定でリプライになる"""
         if self.client is None:
-            raise RuntimeError("XPoster.setup() を先に呼んでください")
+            raise RuntimeError("setup() を先に呼んでください")
+        kwargs = {}
         if is_video:
             media_id = await self.client.upload_media(
-                media_path, wait_for_completion=True, media_category="tweet_video",
-            )
+                media_path, wait_for_completion=True, media_category="tweet_video")
         else:
             media_id = await self.client.upload_media(media_path)
-        tweet = await self.client.create_tweet(text=text, media_ids=[media_id])
+        kwargs["media_ids"] = [media_id]
+        if reply_to:
+            kwargs["reply_to"] = reply_to
+        tweet = await self.client.create_tweet(text=text, **kwargs)
         return tweet.id if hasattr(tweet, 'id') else str(tweet)
+
+    async def reply_text(self, reply_to_id: str, text: str) -> str:
+        """テキストのみのリプライ"""
+        if self.client is None:
+            raise RuntimeError("setup() を先に呼んでください")
+        tweet = await self.client.create_tweet(text=text, reply_to=reply_to_id)
+        return tweet.id if hasattr(tweet, 'id') else str(tweet)
+
+    async def search_mentions(self, query: str, count: int = 20):
+        """検索してツイートリストを返す"""
+        if self.client is None:
+            return []
+        try:
+            return await self.client.search_tweet(query, "Latest", count=count)
+        except Exception as e:
+            log.warning("search_tweet失敗: %s", e)
+            return []
 
     async def close(self):
         pass
 
 
 # ═══════════════════════════════════════════════════════════════
-# Misskey 投稿クライアント
+# 自動返信ハンドラ
 # ═══════════════════════════════════════════════════════════════
 
-class MisskeyPoster:
-    """Misskey API でメディア投稿。drive/files/create → notes/create"""
+class ReplyHandler:
+    """自分のツイートへのリプライを監視して自動返信"""
 
-    def __init__(self, base_url: str = MISSKEY_BASE, token: str = ""):
-        self.base = base_url
-        self.token = token
-        self._http: Optional[httpx.AsyncClient] = None
+    def __init__(self, xposter: XPoster, hikabooru: HikabooruClient,
+                 markov: Optional[MarkovGenerator], db_path: str):
+        self.xposter = xposter
+        self.hikabooru = hikabooru
+        self.markov = markov
+        self.db_path = db_path
+        self.processed: Set[str] = self._load()
+        self.last_reply_time = 0.0
 
-    async def _client(self) -> httpx.AsyncClient:
-        if self._http is None:
-            self._http = httpx.AsyncClient(
-                headers={"User-Agent": USER_AGENT},
-                timeout=60.0,
-            )
-        return self._http
+    def _load(self) -> Set[str]:
+        try:
+            with open(self.db_path) as f:
+                return set(orjson.loads(f.read()))
+        except Exception:
+            return set()
 
-    async def close(self):
-        if self._http:
-            await self._http.aclose()
-            self._http = None
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            with open(self.db_path, "wb") as f:
+                f.write(orjson.dumps(list(self.processed)[-10000:]))
+        except Exception as e:
+            log.warning("replied_ids保存失敗: %s", e)
 
-    async def post_media(self, media_path: str, is_video: bool = False, text: str = "") -> str:
-        """メディアをアップロードしてノート作成。戻り値は note_id。
-        is_video は Misskey では未使用（XPosterとのインターフェース統一のため）"""
-        http = await self._client()
+    def _mark_processed(self, tweet_id: str):
+        self.processed.add(tweet_id)
+        self._save()
 
-        # 1. ファイルをドライブにアップロード
-        file_name = os.path.basename(media_path)
-        with open(media_path, "rb") as f:
-            resp = await http.post(
-                f"{self.base}/api/drive/files/create",
-                data={"i": self.token, "force": "true"},
-                files={"file": (file_name, f)},
-            )
-        resp.raise_for_status()
-        file_data = resp.json()
-        file_id = file_data["id"]
-        log.info("Misskey drive upload: %s (id=%s)", file_name, file_id)
+    async def check_and_reply(self):
+        """新規リプライをチェックして1件だけ返信"""
+        now = datetime.now(timezone.utc).timestamp()
+        if now - self.last_reply_time < REPLY_BACKOFF:
+            return  # 前回の返信から最低300秒
 
-        # 2. ノート作成（text は1文字以上必須）
-        note_text = text if text else " "
-        resp = await http.post(
-            f"{self.base}/api/notes/create",
-            json={
-                "i": self.token,
-                "text": note_text,
-                "fileIds": [file_id],
-                "visibility": "public",
-            },
-        )
-        resp.raise_for_status()
-        note = resp.json()["createdNote"]
-        return note["id"]
+        bot_uid = self.xposter.user_id
+        if not bot_uid:
+            return
+
+        try:
+            tweets = await self.xposter.search_mentions("to:hikabooru", count=30)
+        except Exception:
+            return
+
+        if not tweets:
+            return
+
+        for tweet in tweets:
+            tid = str(tweet.id) if hasattr(tweet, 'id') else ""
+            if not tid or tid in self.processed:
+                continue
+
+            # 自分のツイートへの直接リプライのみ対象
+            reply_to_uid = str(getattr(tweet, 'in_reply_to_user_id', ''))
+            reply_to_tid = str(getattr(tweet, 'in_reply_to_status_id', ''))
+
+            if reply_to_uid != bot_uid:
+                # 他人のツイート宛またはメンション → スキップ
+                self._mark_processed(tid)
+                continue
+
+            if not reply_to_tid:
+                self._mark_processed(tid)
+                continue
+
+            log.info("🔔 リプライ検出: %s → tweet %s", tid, reply_to_tid)
+
+            # 返信する
+            try:
+                await self._do_reply(tid)
+                self.last_reply_time = now
+            except Exception as e:
+                log.error("自動返信失敗: %s", e)
+            finally:
+                self._mark_processed(tid)
+            return  # 1件処理したら終了（連投防止）
+
+    async def _do_reply(self, reply_to_tweet_id: str):
+        """ランダム画像 + マルコフ文 でリプライ"""
+        # ランダムメディア選出
+        while True:
+            post = await self.hikabooru.random_post()
+            ptype = HikabooruClient.post_type(post)
+            if ptype == "flash":
+                continue
+            if ptype == "video":
+                duration = get_video_duration(self.hikabooru.content_url(post))
+                if duration < 0 or duration > MAX_VIDEO_DURATION:
+                    continue
+            break
+
+        is_video = (ptype == "video")
+        markov_text = self.markov.generate(max_tokens=50) if self.markov else ""
+        source_url = self.hikabooru.view_url(post)
+
+        text = f"{markov_text}\n\n{source_url}" if markov_text else source_url
+
+        http = await self.hikabooru._client()
+        tmp_path = await download_media(http, self.hikabooru.content_url(post))
+        converted = convert_for_platform(tmp_path, X_OK_EXTS)
+        if converted != tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        try:
+            tid = await self.xposter.upload_and_tweet(
+                converted, is_video=is_video, text=text, reply_to=reply_to_tweet_id)
+            log.info("🤖 自動返信成功! tweet_id=%s", tid)
+        finally:
+            try:
+                os.unlink(converted)
+            except OSError:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════
 # メディア変換
 # ═══════════════════════════════════════════════════════════════
 
-MISSKEY_OK_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".mp4", ".webm", ".mov"}
 X_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif"}
 X_VIDEO_EXTS = {".mp4"}
 X_OK_EXTS = X_IMAGE_EXTS | X_VIDEO_EXTS
@@ -367,40 +427,30 @@ CONVERSION_MAP = {
 
 
 def convert_for_platform(input_path: str, ok_exts: set[str]) -> str:
-    """
-    X/Misskey非対応フォーマットを ffmpeg で変換。
-    変換不要なら input_path をそのまま返す。
-    """
     ext = os.path.splitext(input_path)[1].lower()
     if ext in ok_exts:
         return input_path
     if ext not in CONVERSION_MAP:
-        log.warning("未知の拡張子 %s、変換なしで試行", ext)
+        log.warning("未知の拡張子 %s、変換なし", ext)
         return input_path
-
     out_ext, ffmpeg_args = CONVERSION_MAP[ext]
     fd, out_path = tempfile.mkstemp(suffix=out_ext, prefix="hikabooru_conv_")
     os.close(fd)
-
     cmd = ["ffmpeg", "-y", "-i", input_path, *ffmpeg_args, out_path]
-    log.info("変換: %s → %s (%s)", ext, out_ext, os.path.basename(out_path))
-
+    log.info("変換: %s → %s", ext, out_ext)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode == 0 and os.path.getsize(out_path) > 0:
-            log.info("変換成功: %.1fMB", os.path.getsize(out_path) / (1024 * 1024))
             return out_path
-        else:
-            log.warning("変換失敗: %s", result.stderr[-200:] if result.stderr else "?")
-            os.unlink(out_path)
-            return input_path
+        log.warning("変換失敗: %s", result.stderr[-200:] if result.stderr else "?")
+        os.unlink(out_path)
     except Exception as e:
         log.warning("変換エラー: %s", e)
         try:
             os.unlink(out_path)
         except OSError:
             pass
-        return input_path
+    return input_path
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -408,7 +458,6 @@ def convert_for_platform(input_path: str, ok_exts: set[str]) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 async def download_media(http: httpx.AsyncClient, url: str) -> str:
-    """ダウンロードして一時ファイルパスを返す（変換は呼び出し側で）"""
     resp = await http.get(url)
     resp.raise_for_status()
     url_ext = os.path.splitext(url.split("?")[0])[1].lower() or ".bin"
@@ -416,58 +465,48 @@ async def download_media(http: httpx.AsyncClient, url: str) -> str:
     os.close(fd)
     with open(tmp_path, "wb") as f:
         f.write(resp.content)
-    size_mb = len(resp.content) / (1024 * 1024)
-    log.info("ダウンロード: %.1fMB → %s", size_mb, tmp_path)
+    log.info("ダウンロード: %.1fMB → %s", len(resp.content) / (1024 * 1024), tmp_path)
     return tmp_path
 
 
-async def platform_loop(
-    name: str,
+async def x_post_loop(
+    xposter: XPoster,
     hikabooru: HikabooruClient,
-    poster,  # XPoster | MisskeyPoster
     interval: int,
-    max_video_duration: int,
-    ok_exts: set[str],
     test_mode: bool,
-    markov: Optional[MarkovGenerator] = None,
+    markov: Optional[MarkovGenerator],
 ):
-    """1プラットフォーム分の投稿ループ"""
-    log.info("[%s] 開始 (間隔=%d秒, 動画制限=%d秒)", name, interval, max_video_duration)
+    """Xへの定期投稿ループ"""
+    log.info("[X] 開始 (間隔=%d秒)", interval)
 
     while True:
         try:
-            # ランダム選出（動画制限はプラットフォーム別）
+            # ランダム選出
             while True:
                 post = await hikabooru.random_post()
                 ptype = HikabooruClient.post_type(post)
-                pid = post["id"]
-
                 if ptype == "flash":
                     continue
-
                 if ptype == "video":
-                    url = hikabooru.content_url(post)
-                    duration = get_video_duration(url)
-                    if duration < 0 or duration > max_video_duration:
-                        log.debug("[%s] #%d 動画%.0f秒 スキップ", name, pid, duration)
+                    duration = get_video_duration(hikabooru.content_url(post))
+                    if duration < 0 or duration > MAX_VIDEO_DURATION:
                         continue
-
                 break
 
-            summary = HikabooruClient.post_summary(post)
+            pid = post["id"]
             is_video = (ptype == "video")
-            log.info("[%s] ✅ %s", name, summary)
-            print(f"\n{'🧪 TEST ' if test_mode else '📤'} [{name}] 選出: {summary}")
+            summary = HikabooruClient.post_summary(post)
+            source_url = hikabooru.view_url(post)
+            log.info("[X] ✅ %s", summary)
 
             if test_mode:
-                print(f"   (テストモードのため投稿スキップ)\n")
+                print(f"\n🧪 TEST 選出: {summary}")
+                print(f"   ソース: {source_url}\n")
             else:
                 content_url = hikabooru.content_url(post)
                 http = await hikabooru._client()
                 tmp_path = await download_media(http, content_url)
-
-                # 変換
-                converted = convert_for_platform(tmp_path, ok_exts)
+                converted = convert_for_platform(tmp_path, X_OK_EXTS)
                 if converted != tmp_path:
                     try:
                         os.unlink(tmp_path)
@@ -476,14 +515,23 @@ async def platform_loop(
 
                 try:
                     markov_text = markov.generate(max_tokens=50) if markov else ""
-                    post_id = await poster.post_media(converted, is_video=is_video, text=markov_text)
+                    tweet_id = await xposter.upload_and_tweet(
+                        converted, is_video=is_video, text=markov_text)
+
                     if markov_text:
-                        log.info("[%s] マルコフ文: %s", name, markov_text[:80])
-                    log.info("[%s] 🎉 投稿成功! post_id=%s | hikabooru_id=%d", name, post_id, pid)
-                    print(f"   ✅ [{name}] 投稿成功! id={post_id}\n")
+                        log.info("[X] マルコフ文: %s", markov_text[:80])
+                    log.info("[X] 🎉 投稿成功! tweet_id=%s | hikabooru_id=%d", tweet_id, pid)
+
+                    # ソースリンクをリプライで貼る
+                    try:
+                        reply_id = await xposter.reply_text(tweet_id, f"🔗 {source_url}")
+                        log.info("[X] ソースリプライ: %s", reply_id)
+                    except Exception as e:
+                        log.warning("[X] ソースリプライ失敗: %s", e)
+
+                    print(f"   ✅ tweet_id={tweet_id}\n")
                 except Exception as e:
-                    log.error("[%s] 投稿失敗 (hikabooru #%d): %s", name, pid, e)
-                    print(f"   ❌ [{name}] 投稿失敗: {e}\n")
+                    log.error("[X] 投稿失敗 (hikabooru #%d): %s", pid, e)
                 finally:
                     try:
                         os.unlink(converted)
@@ -491,69 +539,78 @@ async def platform_loop(
                         pass
 
         except Exception as e:
-            log.error("[%s] 実行エラー: %s", name, e)
+            log.error("[X] 実行エラー: %s", e)
 
         next_run = datetime.now().timestamp() + interval
         next_str = datetime.fromtimestamp(next_run).strftime("%H:%M:%S")
-        log.info("[%s] 次回実行: %s (%d秒後)", name, next_str, interval)
+        log.info("[X] 次回実行: %s (%d秒後)", next_str, interval)
+        await asyncio.sleep(interval)
+
+
+async def reply_loop(
+    handler: ReplyHandler,
+    interval: int,
+):
+    """リプライ監視ループ"""
+    log.info("[返信] 監視開始 (間隔=%d秒)", interval)
+    while True:
+        try:
+            await handler.check_and_reply()
+        except Exception as e:
+            log.error("[返信] エラー: %s", e)
         await asyncio.sleep(interval)
 
 
 async def main_loop(args):
     log.info("hikabooru_x_poster 起動")
     log.info("  hikabooru: %s", HIKABOORU_BASE)
-    log.info("  test_mode: %s", args.test)
-    log.info("  X: %s (間隔=%ds, 動画制限=%ds)", "ON" if not args.no_x else "OFF", args.x_interval, MAX_VIDEO_DURATION)
-    log.info("  Misskey: %s (間隔=%ds, 動画制限=%ds)", "ON" if not args.no_misskey else "OFF", args.misskey_interval, args.misskey_max_duration)
+    log.info("  間隔: %d秒 (%.1f分)", args.interval, args.interval / 60)
+    log.info("  テスト: %s", args.test)
+    log.info("  マルコフ: %s", "OFF" if args.no_markov else "ON")
+    log.info("  自動返信: %s", "OFF" if args.no_reply else "ON")
 
     hikabooru = HikabooruClient()
 
-    # マルコフ連鎖モデル読み込み
+    # マルコフ連鎖
     markov = None
     if not args.no_markov and not args.test:
         try:
             markov = MarkovGenerator(args.markov_model)
-            log.info("マルコフ連鎖: 有効")
         except Exception as e:
-            log.warning("マルコフモデル読み込み失敗（無効で続行）: %s", e)
+            log.warning("マルコフモデル読み込み失敗: %s", e)
 
     tasks = []
 
-    if not args.once:
-        if not args.no_x:
-            if not args.test:
-                xposter = await XPoster(args.cookie).setup()
-            else:
-                xposter = None
-            tasks.append(platform_loop(
-                "X", hikabooru, xposter,
-                args.x_interval, MAX_VIDEO_DURATION, X_OK_EXTS,
-                args.test, markov=markov,
-            ))
-
-        if not args.no_misskey:
-            misskey_poster = MisskeyPoster(token=args.misskey_token)
-            tasks.append(platform_loop(
-                "Misskey", hikabooru, misskey_poster,
-                args.misskey_interval, args.misskey_max_duration, MISSKEY_OK_EXTS,
-                args.test, markov=markov,
-            ))
-
     if args.once:
-        await run_once_all(hikabooru, args)
-    else:
-        try:
-            await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
-            log.info("割り込みにより終了")
+        await run_once(hikabooru, args)
+        await hikabooru.close()
+        return
+
+    # X投稿ループ
+    if not args.no_x:
+        if not args.test:
+            xposter = await XPoster(args.cookie).setup()
+        else:
+            xposter = None
+        tasks.append(x_post_loop(xposter, hikabooru, args.interval, args.test, markov))
+
+        # 自動返信ループ
+        if not args.test and not args.no_reply and xposter:
+            handler = ReplyHandler(xposter, hikabooru, markov, args.reply_db)
+            tasks.append(reply_loop(handler, REPLY_CHECK_INTERVAL))
+
+    try:
+        await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        log.info("割り込みにより終了")
 
     await hikabooru.close()
 
 
-async def run_once_all(hikabooru: HikabooruClient, args):
-    """--once モード: 1回選出して全プラットフォームに投稿"""
+async def run_once(hikabooru: HikabooruClient, args):
+    """--once モード"""
     log.info("━" * 50)
-    log.info("[once] ランダム選出開始 (test_mode=%s)", args.test)
+    log.info("[once] ランダム選出 (test_mode=%s)", args.test)
 
     post = None
     while True:
@@ -562,17 +619,18 @@ async def run_once_all(hikabooru: HikabooruClient, args):
         if ptype == "flash":
             continue
         if ptype == "video":
-            url = hikabooru.content_url(post)
-            duration = get_video_duration(url)
-            if duration < 0 or duration > MAX_VIDEO_DURATION:
+            if get_video_duration(hikabooru.content_url(post)) > MAX_VIDEO_DURATION:
                 continue
         break
 
     summary = HikabooruClient.post_summary(post)
+    source_url = hikabooru.view_url(post)
     content_url = hikabooru.content_url(post)
+    is_video = (ptype == "video")
     log.info("✅ %s", summary)
     print(f"\n📤 選出: {summary}")
     print(f"   URL: {content_url}")
+    print(f"   ソース: {source_url}")
 
     if args.test:
         print("   (テストモードのため投稿スキップ)\n")
@@ -580,16 +638,15 @@ async def run_once_all(hikabooru: HikabooruClient, args):
 
     http = await hikabooru._client()
     tmp_path = await download_media(http, content_url)
+    converted = convert_for_platform(tmp_path, X_OK_EXTS)
+    if converted != tmp_path:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
-    results = {}
-
-    # X
-    ptype = HikabooruClient.post_type(post)
-    is_video = (ptype == "video")
-
-    # マルコフ文
     markov_text = ""
-    if not args.no_markov and not args.test:
+    if not args.no_markov:
         try:
             m = MarkovGenerator(args.markov_model)
             markov_text = m.generate(max_tokens=50)
@@ -598,41 +655,28 @@ async def run_once_all(hikabooru: HikabooruClient, args):
             log.warning("マルコフ生成失敗: %s", e)
 
     if not args.no_x:
-        x_conv = convert_for_platform(tmp_path, X_OK_EXTS)
         xposter = await XPoster(args.cookie).setup()
         try:
-            tid = await xposter.post_media(x_conv, is_video=is_video, text=markov_text)
-            log.info("🎉 X投稿成功! tweet_id=%s | post_id=%d", tid, post["id"])
+            tid = await xposter.upload_and_tweet(converted, is_video=is_video, text=markov_text)
+            log.info("🎉 投稿成功! tweet_id=%s | post_id=%d", tid, post["id"])
             print(f"   ✅ X: tweet_id={tid}")
-            results["X"] = tid
-        except Exception as e:
-            log.error("X投稿失敗: %s", e)
-            print(f"   ❌ X: {e}")
-        if x_conv != tmp_path:
-            os.unlink(x_conv)
 
-    # Misskey
-    if not args.no_misskey:
-        mk_conv = convert_for_platform(tmp_path, MISSKEY_OK_EXTS)
-        misskey = MisskeyPoster(token=args.misskey_token)
-        try:
-            nid = await misskey.post_media(mk_conv, text=markov_text)
-            log.info("🎉 Misskey投稿成功! note_id=%s | post_id=%d", nid, post["id"])
-            print(f"   ✅ Misskey: note_id={nid}")
-            results["Misskey"] = nid
+            # ソースリプライ
+            try:
+                rid = await xposter.reply_text(tid, f"🔗 {source_url}")
+                log.info("ソースリプライ: %s", rid)
+                print(f"   🔗 ソースリプライ: {rid}")
+            except Exception as e:
+                log.warning("ソースリプライ失敗: %s", e)
         except Exception as e:
-            log.error("Misskey投稿失敗: %s", e)
-            print(f"   ❌ Misskey: {e}")
-        if mk_conv != tmp_path:
-            os.unlink(mk_conv)
+            log.error("投稿失敗: %s", e)
+            print(f"   ❌ X: {e}")
 
     try:
-        os.unlink(tmp_path)
+        os.unlink(converted)
     except OSError:
         pass
-
     print()
-    return results
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -640,40 +684,23 @@ async def run_once_all(hikabooru: HikabooruClient, args):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="hikabooru → X/Misskey マルチ投稿bot")
-    parser.add_argument("--test", action="store_true",
-                        help="テストモード（ランダム選出のみ、投稿しない）")
-    parser.add_argument("--once", action="store_true",
-                        help="1回だけ実行して終了")
-    parser.add_argument("--cookie", type=str, default=_default_cookie_path(),
-                        help="ブラウザエクスポートCookieのJSONファイルパス")
-    # X 用
-    parser.add_argument("--x-interval", type=int, default=X_DEFAULT_INTERVAL,
-                        help=f"X投稿間隔（秒）（デフォルト: {X_DEFAULT_INTERVAL}秒=30分）")
-    parser.add_argument("--no-x", action="store_true",
-                        help="Xを無効にする")
-    # Misskey 用
-    parser.add_argument("--misskey-interval", type=int, default=MISSKEY_DEFAULT_INTERVAL,
-                        help=f"Misskey投稿間隔（秒）（デフォルト: {MISSKEY_DEFAULT_INTERVAL}秒=30分）")
-    parser.add_argument("--misskey-token", type=str, required=False, default="",
-                        help="Misskey APIトークン")
-    parser.add_argument("--misskey-max-duration", type=int, default=600,
-                        help="Misskeyの動画最大秒数（デフォルト: 600秒=10分）")
-    parser.add_argument("--no-misskey", action="store_true",
-                        help="Misskeyを無効にする")
-    # マルコフ連鎖
+    parser = argparse.ArgumentParser(description="hikabooru → X 投稿bot")
+    parser.add_argument("--test", action="store_true", help="テストモード")
+    parser.add_argument("--once", action="store_true", help="1回だけ実行")
+    parser.add_argument("--cookie", type=str, default=_default_cookie_path(), help="Cookie JSON")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
+                        help=f"投稿間隔（秒）（デフォルト: {DEFAULT_INTERVAL}秒=30分）")
+    parser.add_argument("--no-x", action="store_true", help="Xを無効")
     parser.add_argument("--markov-model", type=str, default=_default_markov_path(),
-                        help="マルコフ連鎖モデルの.pklファイルパス")
-    parser.add_argument("--no-markov", action="store_true",
-                        help="マルコフ連鎖テキスト生成を無効にする")
+                        help="マルコフモデル.pkl")
+    parser.add_argument("--no-markov", action="store_true", help="マルコフ無効")
+    parser.add_argument("--no-reply", action="store_true", help="自動返信無効")
+    parser.add_argument("--reply-db", type=str, default=_default_reply_db_path(),
+                        help="返信済みIDの保存先")
     args = parser.parse_args()
 
-    if args.no_x and args.no_misskey:
-        print("❌ --no-x と --no-misskey の両方は指定できません")
-        sys.exit(1)
-
     if not args.no_x and not os.path.exists(args.cookie):
-        print(f"❌ Cookieファイルが見つかりません: {args.cookie}")
+        print(f"❌ Cookieファイル不在: {args.cookie}")
         sys.exit(1)
 
     asyncio.run(main_loop(args))

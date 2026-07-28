@@ -1,5 +1,6 @@
 # Coolify 用 docker-compose.yml
-# hikabooru → X 投稿 bot（30分間隔 + マルコフ連鎖テキスト）
+# hikabooru → X 投稿 bot
+# 30分間隔 + マルコフ連鎖テキスト + ソースリプライ + 自動返信
 
 services:
   hikabooru-x-poster:
@@ -17,5 +18,4 @@ services:
         echo "$${COOKIE_JSON}" > /app/data/cookie.json
         exec python3 hikabooru_x_poster.py \
           --cookie /app/data/cookie.json \
-          --x-interval 1800 \
-          --no-misskey
+          --interval 1800
