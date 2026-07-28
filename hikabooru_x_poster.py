@@ -362,23 +362,16 @@ class ReplyHandler:
                 continue
 
             # 自分のツイートへの直接リプライのみ対象
-            reply_to_uid = str(getattr(tweet, 'in_reply_to_user_id', ''))
-            reply_to_tid = str(getattr(tweet, 'in_reply_to_status_id', ''))
-
-            if reply_to_uid != bot_uid:
-                # 他人のツイート宛またはメンション → スキップ
-                log.info("🔕 reply_to_uid不一致: %s (期待=%s, 実際=%s)", tid, bot_uid, reply_to_uid)
-                self._mark_processed(tid)
-                continue
-
-            if not reply_to_tid:
+            # twiforkの検索結果では in_reply_to にリプライ先ツイートIDが入る
+            reply_to_tid = str(getattr(tweet, 'in_reply_to', 0) or 0)
+            if reply_to_tid == '0':
                 log.info("🔕 reply先なし (直接メンション): %s", tid)
                 self._mark_processed(tid)
                 continue
 
             # 自分の「オリジナル投稿」へのリプライのみ（リプライのリプライは除外）
             if not self.xposter.is_my_original(reply_to_tid):
-                log.info("🔕 リプライのリプライをスキップ: %s → %s", tid, reply_to_tid)
+                log.info("🔕 リプライのリプライ/他人宛をスキップ: %s → %s", tid, reply_to_tid)
                 self._mark_processed(tid)
                 continue
 
