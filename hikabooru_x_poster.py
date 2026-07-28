@@ -187,7 +187,7 @@ class HikabooruClient:
         return f"{self.base}/{post['contentUrl']}"
 
     def view_url(self, post: dict) -> str:
-        return f"{self.base}/post/view/{post['id']}"
+        return f"{self.base}/post/{post['id']}"
 
     @staticmethod
     def post_type(post: dict) -> str:
