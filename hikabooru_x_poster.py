@@ -191,7 +191,7 @@ class HikabooruClient:
     def content_url(self, post: dict) -> str:
         url = post.get('contentUrl') or post.get('content_url') or ''
         if not url:
-            raise KeyError(f"contentUrl not found in post #{post.get('id', '?')}")
+            return ''
         return f"{self.base}/{url}"
 
     def view_url(self, post: dict) -> str:
@@ -554,6 +554,9 @@ async def x_post_loop(
                 print(f"   ソース: {source_url}\n")
             else:
                 content_url = hikabooru.content_url(post)
+                if not content_url:
+                    log.warning("[X] contentUrlなし → 再抽選 (hikabooru #%d)", pid)
+                    continue
                 http = await hikabooru._client()
                 tmp_path = await download_media(http, content_url)
                 converted = convert_for_platform(tmp_path, X_OK_EXTS)
