@@ -189,7 +189,10 @@ class HikabooruClient:
         return results[0]
 
     def content_url(self, post: dict) -> str:
-        return f"{self.base}/{post['contentUrl']}"
+        url = post.get('contentUrl') or post.get('content_url') or ''
+        if not url:
+            raise KeyError(f"contentUrl not found in post #{post.get('id', '?')}")
+        return f"{self.base}/{url}"
 
     def view_url(self, post: dict) -> str:
         return f"{self.base}/post/{post['id']}"
