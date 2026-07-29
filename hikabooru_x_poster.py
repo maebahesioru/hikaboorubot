@@ -189,15 +189,10 @@ class HikabooruClient:
         return results[0]
 
     def content_url(self, post: dict) -> str:
-        # APIが contentUrl を返さなくなったので thumbnailUrl から復元
-        thumb = post.get('thumbnailUrl', '')
-        if not thumb:
+        url = post.get('contentUrl') or post.get('content_url') or ''
+        if not url:
             return ''
-        # data/generated-thumbnails/.../hash.jpg → data/posts/.../hash
-        content_base = thumb.replace('generated-thumbnails', 'posts').rsplit('.', 1)[0]
-        ptype = post.get('type', 'image')
-        ext = '.mp4' if ptype == 'video' else '.jpg'
-        return f"{self.base}/{content_base}{ext}"
+        return f"{self.base}/{url}"
 
     def view_url(self, post: dict) -> str:
         return f"{self.base}/post/{post['id']}"
