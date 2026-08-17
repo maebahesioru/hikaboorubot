@@ -297,6 +297,18 @@ class XPoster:
         tweet = await self.client.create_tweet(text=text, **kwargs)
         return tweet.id if hasattr(tweet, 'id') else str(tweet)
 
+    async def favorite_tweet(self, tweet_id: str) -> bool:
+        """ツイートにいいねする"""
+        if self.client is None:
+            return False
+        try:
+            await self.client.favorite_tweet(tweet_id)
+            log.info("❤️ いいね: %s", tweet_id)
+            return True
+        except Exception as e:
+            log.warning("いいね失敗 %s: %s", tweet_id, e)
+            return False
+
     async def reply_text(self, reply_to_id: str, text: str) -> str:
         """テキストのみのリプライ"""
         if self.client is None:
@@ -404,6 +416,12 @@ class ReplyHandler:
                 continue
 
             log.info("🔔 リプライ検出: %s → tweet %s", tid, reply_to_tid)
+
+            # 返信前に元ツイートにいいね
+            try:
+                await self.xposter.favorite_tweet(tid)
+            except Exception as e:
+                log.warning("いいね失敗（続行）: %s", e)
 
             # 返信する
             try:
