@@ -401,21 +401,41 @@ class ReplyHandler:
                 self._mark_processed(tid)
                 continue
 
-            # 自分のツイートへの直接リプライのみ対象
+            # 自分のツイートへの直接リプライ or 引用リツイートが対象
             # twiforkの検索結果では in_reply_to にリプライ先ツイートIDが入る
-            reply_to_tid = str(getattr(tweet, 'in_reply_to', 0) or 0)
-            if reply_to_tid == '0':
-                log.info("🔕 reply先なし (直接メンション): %s", tid)
-                self._mark_processed(tid)
-                continue
+            is_quote = False
+            quote_target = ""
+            try:
+                is_quote = bool(getattr(tweet, "is_quote_status", False))
+            except Exception:
+                is_quote = False
+            try:
+                if is_quote:
+                    quote_target = str(tweet.quoted_status_id() or 0)
+            except Exception:
+                pass
 
-            # 自分の「オリジナル投稿」へのリプライのみ（リプライのリプライは除外）
-            if not self.xposter.is_my_original(reply_to_tid):
-                log.info("🔕 リプライのリプライ/他人宛をスキップ: %s → %s", tid, reply_to_tid)
-                self._mark_processed(tid)
-                continue
+            if is_quote:
+                # 引用リツイート: 引用元が自分のオリジナル投稿なら対象
+                if not (quote_target and self.xposter.is_my_original(quote_target)):
+                    log.info("🔕 引用リツイート(他人宛): %s → %s", tid, quote_target)
+                    self._mark_processed(tid)
+                    continue
+                log.info("🔔 引用リツイート検出: %s (引用元 %s)", tid, quote_target)
+            else:
+                # 通常のリプライ
+                reply_to_tid = str(getattr(tweet, "in_reply_to", 0) or 0)
+                if reply_to_tid == '0':
+                    log.info("🔕 reply先なし (直接メンション): %s", tid)
+                    self._mark_processed(tid)
+                    continue
 
-            log.info("🔔 リプライ検出: %s → tweet %s", tid, reply_to_tid)
+                # 自分の「オリジナル投稿」へのリプライのみ（リプライのリプライは除外）
+                if not self.xposter.is_my_original(reply_to_tid):
+                    log.info("🔕 リプライのリプライ/他人宛をスキップ: %s → %s", tid, reply_to_tid)
+                    self._mark_processed(tid)
+                    continue
+                log.info("🔔 リプライ検出: %s → tweet %s", tid, reply_to_tid)
 
             # 返信前に元ツイートにいいね
             try:
