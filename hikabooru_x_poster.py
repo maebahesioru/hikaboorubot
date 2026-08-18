@@ -326,6 +326,26 @@ class XPoster:
             log.warning("search_tweet失敗: %s", e)
             return []
 
+    async def get_mentions_from_notifications(self, count: int = 40):
+        """通知(Mentions)から自分宛のツイートを取得する。
+        メンション・リプライ・引用リツイートを含む（@メンション無しでも拾える）"""
+        if self.client is None:
+            return []
+        try:
+            notifications = await self.client.get_notifications("Mentions", count=count)
+            tweets = []
+            for n in notifications:
+                try:
+                    if n.tweet is not None:
+                        tweets.append(n.tweet)
+                except Exception:
+                    continue
+            log.info("🔔 通知取得: %d件のツイート", len(tweets))
+            return tweets
+        except Exception as e:
+            log.warning("get_notifications失敗: %s", e)
+            return []
+
     async def close(self):
         pass
 
@@ -376,7 +396,7 @@ class ReplyHandler:
             return
 
         try:
-            tweets = await self.xposter.search_mentions("@hikabooru", count=30)
+            tweets = await self.xposter.get_mentions_from_notifications(count=40)
         except Exception:
             return
 
