@@ -327,12 +327,13 @@ class XPoster:
             return []
 
     async def get_mentions_from_notifications(self, count: int = 40):
-        """通知(Mentions)から自分宛のツイートを取得する。
-        メンション・リプライ・引用リツイートを含む（@メンション無しでも拾える）"""
+        """通知から自分宛のツイートを取得する。
+        All通知でリプライ・引用リツイート・RT・いいね等を取得し、
+        呼び出し側で自分宛のもの（リプ/引用）だけを判定する"""
         if self.client is None:
             return []
         try:
-            notifications = await self.client.get_notifications("Mentions", count=count)
+            notifications = await self.client.get_notifications("All", count=count)
             tweets = []
             for n in notifications:
                 try:
@@ -340,7 +341,7 @@ class XPoster:
                         tweets.append(n.tweet)
                 except Exception:
                     continue
-            log.info("🔔 通知取得: %d件のツイート", len(tweets))
+            log.info("🔔 通知取得(All): %d件のツイート", len(tweets))
             return tweets
         except Exception as e:
             log.warning("get_notifications失敗: %s", e)
