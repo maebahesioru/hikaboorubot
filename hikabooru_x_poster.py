@@ -270,7 +270,29 @@ class XPoster:
             log.info("X認証OK (user_id=%s)", self._my_user_id)
         except Exception as e:
             log.warning("X認証警告: %s", e)
+        # 再起動後も過去の投稿へのリプに反応できるよう直近ツイートをロード
+        await self.load_recent_tweets()
         return self
+
+    async def load_recent_tweets(self, limit: int = 100):
+        """自分の直近のオリジナル投稿を取得して my_tweet_ids に追加"""
+        if self.client is None:
+            return
+        my_id = self.user_id
+        if not my_id:
+            return
+        try:
+            tweets = await self.client.get_user_tweets(my_id, "Tweets", count=limit)
+            added = 0
+            for t in tweets:
+                tid = str(t.id)
+                if tid not in self.my_tweet_ids:
+                    self.my_tweet_ids.add(tid)
+                    added += 1
+            self._save_tweet_ids()
+            log.info("直近ツイート %d件ロード (my_tweet_ids=%d)", added, len(self.my_tweet_ids))
+        except Exception as e:
+            log.warning("直近ツイートロード失敗: %s", e)
 
     @property
     def user_id(self) -> str:

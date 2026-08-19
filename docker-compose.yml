@@ -10,6 +10,8 @@ services:
     environment:
       - TZ=Asia/Tokyo
       - COOKIE_JSON=${COOKIE_JSON:-}
+    volumes:
+      - hikabooru-data:/app/data
     command:
       - "/bin/sh"
       - "-c"
@@ -19,3 +21,6 @@ services:
         exec python3 hikabooru_x_poster.py \
           --cookie /app/data/cookie.json \
           --interval 1800
+
+volumes:
+  hikabooru-data:
