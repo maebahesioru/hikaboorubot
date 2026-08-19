@@ -327,25 +327,59 @@ class XPoster:
             return []
 
     async def get_mentions_from_notifications(self, count: int = 40):
-        """通知から自分宛のツイートを取得する。
-        All通知でリプライ・引用リツイート・RT・いいね等を取得し、
-        呼び出し側で自分宛のもの（リプ/引用）だけを判定する"""
+        """Mentions通知から自分宛のツイートを取得する。
+
+        XのMentions通知レスポンスは globalObjects.notifications を持たず、
+        globalObjects.tweets にメンション/返信ツイートが直接入っている。
+        twiforkの get_notifications() は古い形式を期待するため0件になる
+        ので、rawレスポンスから直接ツイートを抽出する。"""
         if self.client is None:
             return []
         try:
-            notifications = await self.client.get_notifications("All", count=count)
+            response, _ = await self.client.v11.notifications_mentions(count, None)
+            tweets_map = response.get('globalObjects', {}).get('tweets', {})
+            bot_uid = self.user_id
+
             tweets = []
-            for n in notifications:
+            for tid, tdata in tweets_map.items():
                 try:
-                    if n.tweet is not None:
-                        tweets.append(n.tweet)
+                    # 自分自身のツイートは除外（通知に混ざる元ツイート等）
+                    if bot_uid and str(tdata.get('user_id_str', '')) == bot_uid:
+                        continue
+                    # Tweetオブジェクト化（ReplyHandlerの判定ロジックをそのまま使う）
+                    t = self._tweet_from_data(tid, tdata)
+                    if t is not None:
+                        tweets.append(t)
                 except Exception:
                     continue
-            log.info("🔔 通知取得(All): %d件のツイート", len(tweets))
+            log.info("🔔 通知取得(Mentions): %d件のツイート", len(tweets))
             return tweets
         except Exception as e:
             log.warning("get_notifications失敗: %s", e)
             return []
+
+    def _tweet_from_data(self, tid: str, tdata: dict):
+        """globalObjects.tweets のデータから Tweet オブジェクトを生成"""
+        try:
+            from twikit.user import User
+            from twikit.utils import build_user_data, build_tweet_data
+            from twikit.tweet import Tweet
+
+            uid = str(tdata.get('user_id_str', ''))
+            if not uid:
+                return None
+            # ユーザーデータは無いので最小のUserを作る
+            ud = build_user_data({
+                'id': uid,
+                'rest_id': uid,
+                'screen_name': tdata.get('user_id_str', ''),
+            })
+            if isinstance(ud.get('location'), str):
+                ud['location'] = {'location': ud['location']}
+            user = User(self.client, ud)
+            return Tweet(self.client, build_tweet_data(tdata), user)
+        except Exception:
+            return None
 
     async def close(self):
         pass
