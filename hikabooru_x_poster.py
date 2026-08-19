@@ -49,7 +49,7 @@ _txn.ClientTransaction.__init__ = _patched_init
 # 設定
 # ═══════════════════════════════════════════════════════════════
 
-HIKABOORU_BASE = "https://hikabooru.hikamer.f5.si"
+HIKABOORU_BASE = "https://hikabooru.hikamers.app"
 MAX_VIDEO_DURATION = 140
 DEFAULT_INTERVAL = 1800  # 30分
 REPLY_CHECK_INTERVAL = 90  # リプライチェック間隔（秒）
