@@ -338,6 +338,13 @@ class XPoster:
         tweet = await self.client.create_tweet(text=text, reply_to=reply_to_id)
         return tweet.id if hasattr(tweet, 'id') else str(tweet)
 
+    async def post_text(self, text: str) -> str:
+        """テキストのみのツイート（hikabooruダウンのフォールバック用）"""
+        if self.client is None:
+            raise RuntimeError("setup() を先に呼んでください")
+        tweet = await self.client.create_tweet(text=text)
+        return tweet.id if hasattr(tweet, 'id') else str(tweet)
+
     async def search_mentions(self, query: str, count: int = 20):
         """検索してツイートリストを返す"""
         if self.client is None:
@@ -534,43 +541,67 @@ class ReplyHandler:
             log.info("[返信] チェック: 新規%d件 → 対象なし", found_count)
 
     async def _do_reply(self, reply_to_tweet_id: str):
-        """ランダム画像 + マルコフ文 でリプライ"""
-        # ランダムメディア選出
-        while True:
-            post = await self.hikabooru.random_post()
-            ptype = HikabooruClient.post_type(post)
-            if ptype == "flash":
-                continue
-            if ptype == "video":
-                duration = get_video_duration(self.hikabooru.content_url(post))
-                if duration < 0 or duration > MAX_VIDEO_DURATION:
-                    continue
-            break
-
-        is_video = (ptype == "video")
-        markov_text = self.markov.generate(max_tokens=50) if self.markov else ""
-        source_url = self.hikabooru.view_url(post)
-
-        text = f"{markov_text}\n\n{source_url}" if markov_text else source_url
-
-        http = await self.hikabooru._client()
-        tmp_path = await download_media(http, self.hikabooru.content_url(post))
-        converted = convert_for_platform(tmp_path, X_OK_EXTS)
-        if converted != tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
+        """ランダム画像 + マルコフ文 でリプライ。hikabooruダウン時はマルコフのみ"""
+        tmp_path = None
+        converted = None
+        is_video = False
+        source_url = ""
         try:
-            tid = await self.xposter.upload_and_tweet(
-                converted, is_video=is_video, text=text, reply_to=reply_to_tweet_id)
-            log.info("🤖 自動返信成功! tweet_id=%s", tid)
-        finally:
+            # ランダムメディア選出
+            while True:
+                post = await self.hikabooru.random_post()
+                ptype = HikabooruClient.post_type(post)
+                if ptype == "flash":
+                    continue
+                if ptype == "video":
+                    duration = get_video_duration(self.hikabooru.content_url(post))
+                    if duration < 0 or duration > MAX_VIDEO_DURATION:
+                        continue
+                break
+
+            is_video = (ptype == "video")
+            source_url = self.hikabooru.view_url(post)
+
+            http = await self.hikabooru._client()
+            tmp_path = await download_media(http, self.hikabooru.content_url(post))
+            converted = convert_for_platform(tmp_path, X_OK_EXTS)
+            if converted != tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                tmp_path = None
+        except Exception as e:
+            # hikabooruダウン時はマルコフのみで返信にフォールバック
+            log.warning("🤖 hikabooruメディア取得失敗 → マルコフのみで返信します: %s", e)
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            converted = None
+
+        markov_text = self.markov.generate(max_tokens=50) if self.markov else ""
+
+        if converted is not None:
+            text = f"{markov_text}\n\n{source_url}" if markov_text else source_url
             try:
-                os.unlink(converted)
-            except OSError:
-                pass
+                tid = await self.xposter.upload_and_tweet(
+                    converted, is_video=is_video, text=text, reply_to=reply_to_tweet_id)
+                log.info("🤖 自動返信成功! tweet_id=%s", tid)
+            finally:
+                try:
+                    os.unlink(converted)
+                except OSError:
+                    pass
+        else:
+            # フォールバック: マルコフ文のみで返信（ソースリンク無し）
+            text = markov_text or "…"
+            try:
+                tid = await self.xposter.reply_text(reply_to_tweet_id, text)
+                log.info("🤖 自動返信成功(マルコフのみ)! tweet_id=%s", tid)
+            except Exception as e:
+                log.error("🤖 自動返信失敗: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -646,41 +677,63 @@ async def x_post_loop(
 
     while True:
         try:
-            # ランダム選出
-            while True:
-                post = await hikabooru.random_post()
-                ptype = HikabooruClient.post_type(post)
-                if ptype == "flash":
-                    continue
-                if ptype == "video":
-                    duration = get_video_duration(hikabooru.content_url(post))
-                    if duration < 0 or duration > MAX_VIDEO_DURATION:
+            # ── メディア選出 + ダウンロード ──
+            # hikabooru がダウンしていたら post=None にしてマルコフのみにフォールバック
+            media_ok = False
+            tmp_path = None
+            converted = None
+            pid = None
+            is_video = False
+            source_url = ""
+            summary = ""
+            try:
+                # ランダム選出
+                while True:
+                    post = await hikabooru.random_post()
+                    ptype = HikabooruClient.post_type(post)
+                    if ptype == "flash":
                         continue
-                break
+                    if ptype == "video":
+                        duration = get_video_duration(hikabooru.content_url(post))
+                        if duration < 0 or duration > MAX_VIDEO_DURATION:
+                            continue
+                    break
 
-            pid = post["id"]
-            is_video = (ptype == "video")
-            summary = HikabooruClient.post_summary(post)
-            source_url = hikabooru.view_url(post)
-            log.info("[X] ✅ %s", summary)
+                pid = post["id"]
+                is_video = (ptype == "video")
+                summary = HikabooruClient.post_summary(post)
+                source_url = hikabooru.view_url(post)
+                log.info("[X] ✅ %s", summary)
 
-            if test_mode:
-                print(f"\n🧪 TEST 選出: {summary}")
-                print(f"   ソース: {source_url}\n")
-            else:
-                content_url = hikabooru.content_url(post)
-                if not content_url:
-                    log.warning("[X] contentUrlなし → 再抽選 (hikabooru #%d)", pid)
-                    continue
-                http = await hikabooru._client()
-                tmp_path = await download_media(http, content_url)
-                converted = convert_for_platform(tmp_path, X_OK_EXTS)
-                if converted != tmp_path:
+                if not test_mode:
+                    content_url = hikabooru.content_url(post)
+                    if not content_url:
+                        raise RuntimeError("contentUrlなし (hikabooru #%s)" % pid)
+                    http = await hikabooru._client()
+                    tmp_path = await download_media(http, content_url)
+                    converted = convert_for_platform(tmp_path, X_OK_EXTS)
+                    if converted != tmp_path:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                    media_ok = True
+            except Exception as e:
+                # hikabooru ダウン or メディア失敗 → 後片付けしてフォールバック
+                log.warning("[X] hikabooruメディア取得失敗 → マルコフのみで投稿します: %s", e)
+                if tmp_path:
                     try:
                         os.unlink(tmp_path)
                     except OSError:
                         pass
+                media_ok = False
+                converted = None
 
+            # ── 投稿 ──
+            if test_mode and pid is not None:
+                print(f"\n🧪 TEST 選出: {summary}")
+                print(f"   ソース: {source_url}\n")
+            elif media_ok and converted is not None:
                 try:
                     markov_text = markov.generate(max_tokens=50) if markov else ""
                     tweet_id = await xposter.upload_and_tweet(
@@ -709,6 +762,16 @@ async def x_post_loop(
                         os.unlink(converted)
                     except OSError:
                         pass
+            else:
+                # ── フォールバック: マルコフ文のみ投稿（ソースリンク無し）──
+                if markov and not test_mode:
+                    markov_text = markov.generate(max_tokens=50)
+                    tweet_id = await xposter.post_text(markov_text)
+                    log.info("[X] ⚠️ hikabooruダウン → マルコフのみ投稿: tweet_id=%s", tweet_id)
+                    xposter.my_tweet_ids.add(tweet_id)
+                    xposter._save_tweet_ids()
+                else:
+                    log.warning("[X] hikabooruメディア取得失敗 かつ マルコフOFF → この周期はスキップ")
 
         except Exception as e:
             log.error("[X] 実行エラー: %s", e)
